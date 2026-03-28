@@ -89,13 +89,13 @@ void DecoderThread::run()
 // Each thread:
 //   1. Atomically claims a chunk (disjoint frame range)
 //   2. Opens its OWN SourceVideo (SourceVideo is not thread-safe)
-//   3. Loads all fields for the chunk, including guard frames for temporal
-//      context at boundaries (the 3D model has temporal depth 4)
-//   4. Decodes the full range (guards + real frames)
-//   5. Outputs only the non-guard (central) frames
+//   3. Processes its chunk in small batches (bounded memory)
+//   4. Guard frames at chunk boundaries are decoded for temporal context
+//      but their output is discarded
 //
-// Guard frames are fully decoded so that split3D's temporal window is
-// populated correctly at chunk boundaries.  Their output is discarded.
+// Memory is bounded: each thread holds at most BATCH_SIZE frames at a
+// time (~16 frames ≈ 16 MB fields + 38 MB FrameBuffers per thread),
+// regardless of chunk size.
 // =========================================================================
 void DecoderThread::runChunk()
 {
@@ -119,44 +119,58 @@ void DecoderThread::runChunk()
         return;
     }
 
-    // Load all fields for the chunk (guard frames + real frames),
-    // plus the decoder's own lookBehind/lookAhead for split3D's
-    // temporal window at the edges of the loaded range.
-    const qint32 numLoadFrames = chunk.loadEnd - chunk.loadStart;
-    QVector<SourceField> fields;
-    qint32 startIndex, endIndex;
+    const qint32 lookBehind = decoderPool.getDecoderLookBehind();
+    const qint32 lookAhead = decoderPool.getDecoderLookAhead();
 
-    SourceField::loadFields(sourceVideo, decoderPool.getMetaData(),
-                            chunk.loadStart, numLoadFrames,
-                            decoderPool.getDecoderLookBehind(),
-                            decoderPool.getDecoderLookAhead(),
-                            fields, startIndex, endIndex);
+    // Process the chunk in small batches to bound memory usage.
+    static constexpr qint32 BATCH_SIZE = 16;
+    qint32 frameNumber = chunk.loadStart;
+
+    QVector<SourceField> fields;
+    QVector<ComponentFrame> componentFrames;
+    QVector<OutputFrame> outputFrames;
+
+    while (frameNumber < chunk.loadEnd && !abort) {
+        const qint32 batchFrames = qMin(static_cast<qint32>(BATCH_SIZE),
+                                        chunk.loadEnd - frameNumber);
+
+        // Load this batch's fields (with decoder lookBehind/lookAhead)
+        qint32 startIndex, endIndex;
+        SourceField::loadFields(sourceVideo, decoderPool.getMetaData(),
+                                frameNumber, batchFrames,
+                                lookBehind, lookAhead,
+                                fields, startIndex, endIndex);
+
+        const qint32 numFrames = (endIndex - startIndex) / 2;
+        componentFrames.resize(numFrames);
+
+        // Decode this batch through the full pipeline
+        decodeFrames(fields, startIndex, endIndex, componentFrames);
+
+        if (abort) break;
+
+        // Output only frames within the real range [chunkStart, chunkEnd).
+        // Guard frames (outside this range) are decoded but discarded.
+        const qint32 batchOutputStart = qMax(frameNumber, chunk.chunkStart);
+        const qint32 batchOutputEnd = qMin(frameNumber + batchFrames, chunk.chunkEnd);
+
+        if (batchOutputStart < batchOutputEnd) {
+            const qint32 outputCount = batchOutputEnd - batchOutputStart;
+            outputFrames.resize(outputCount);
+
+            const qint32 offsetInBatch = batchOutputStart - frameNumber;
+            for (qint32 i = 0; i < outputCount; i++) {
+                outputWriter.convert(componentFrames[offsetInBatch + i], outputFrames[i]);
+            }
+
+            if (!decoderPool.putOutputFrames(batchOutputStart, outputFrames)) {
+                abort = true;
+                break;
+            }
+        }
+
+        frameNumber += batchFrames;
+    }
 
     sourceVideo.close();
-
-    if (abort) return;
-
-    // Decode all frames (guard + real) through the full pipeline
-    const qint32 numDecodeFrames = (endIndex - startIndex) / 2;
-    QVector<ComponentFrame> componentFrames(numDecodeFrames);
-
-    decodeFrames(fields, startIndex, endIndex, componentFrames);
-
-    if (abort) return;
-
-    // Convert and output only the non-guard (central) frames.
-    // componentFrames[0]         = loadStart
-    // componentFrames[guardBefore] = chunkStart  (first real output frame)
-    const qint32 outputCount = chunk.chunkEnd - chunk.chunkStart;
-    QVector<OutputFrame> outputFrames(outputCount);
-
-    for (qint32 i = 0; i < outputCount; i++) {
-        outputWriter.convert(componentFrames[chunk.guardBefore + i], outputFrames[i]);
-    }
-
-    // Write frames to the output file (the pool's pending-frame map
-    // handles reordering across chunks automatically).
-    if (!decoderPool.putOutputFrames(chunk.chunkStart, outputFrames)) {
-        abort = true;
-    }
 }
