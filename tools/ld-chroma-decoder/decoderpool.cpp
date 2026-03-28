@@ -252,6 +252,19 @@ bool DecoderPool::getChunkAssignment(ChunkInfo &chunk)
     return true;
 }
 
+void DecoderPool::loadFieldsSafe(SourceVideo &sourceVideo, qint32 firstFrame, qint32 numFrames,
+                                 qint32 lookBehind, qint32 lookAhead,
+                                 QVector<SourceField> &fields, qint32 &startIndex, qint32 &endIndex)
+{
+    // Serialize access to ldDecodeMetaData which may not be thread-safe.
+    // In chunk mode, inputMutex is otherwise unused (getInputFrames is not called).
+    // Each thread's own SourceVideo is passed through — only metadata is shared.
+    QMutexLocker locker(&inputMutex);
+    SourceField::loadFields(sourceVideo, ldDecodeMetaData,
+                            firstFrame, numFrames, lookBehind, lookAhead,
+                            fields, startIndex, endIndex);
+}
+
 // Write one output frame. You must hold outputMutex to call this.
 //
 // The worker threads will complete frames in an arbitrary order, so we can't

@@ -134,12 +134,14 @@ void DecoderThread::runChunk()
         const qint32 batchFrames = qMin(static_cast<qint32>(BATCH_SIZE),
                                         chunk.loadEnd - frameNumber);
 
-        // Load this batch's fields (with decoder lookBehind/lookAhead)
+        // Load this batch's fields (with decoder lookBehind/lookAhead).
+        // Uses the pool's mutex to serialize LdDecodeMetaData access —
+        // its getter methods may not be safe for concurrent reads.
         qint32 startIndex, endIndex;
-        SourceField::loadFields(sourceVideo, decoderPool.getMetaData(),
-                                frameNumber, batchFrames,
-                                lookBehind, lookAhead,
-                                fields, startIndex, endIndex);
+        decoderPool.loadFieldsSafe(sourceVideo,
+                                   frameNumber, batchFrames,
+                                   lookBehind, lookAhead,
+                                   fields, startIndex, endIndex);
 
         const qint32 numFrames = (endIndex - startIndex) / 2;
         componentFrames.resize(numFrames);

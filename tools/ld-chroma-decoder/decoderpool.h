@@ -65,9 +65,17 @@ public:
     bool isChunkMode() const { return chunkMode; }
     bool getChunkAssignment(ChunkInfo &chunk);
     QString getInputFileName() const { return inputFileName; }
-    LdDecodeMetaData &getMetaData() { return ldDecodeMetaData; }
     qint32 getDecoderLookBehind() const { return decoderLookBehind; }
     qint32 getDecoderLookAhead() const { return decoderLookAhead; }
+
+    // V4: Thread-safe field loader — serializes access to LdDecodeMetaData
+    // (which may not be thread-safe for concurrent reads).  Each thread
+    // passes its OWN SourceVideo; only the metadata access is serialized.
+    void loadFieldsSafe(SourceVideo &sourceVideo, qint32 firstFrame, qint32 numFrames,
+                        qint32 lookBehind, qint32 lookAhead,
+                        QVector<SourceField> &fields, qint32 &startIndex, qint32 &endIndex);
+
+    LdDecodeMetaData &getMetaData() { return ldDecodeMetaData; }
 
     // For worker threads: get the configured OutputWriter
     OutputWriter &getOutputWriter() {
