@@ -96,6 +96,7 @@ static std::wstring              g_modelPath;       // Windows: ORT requires wch
 static std::string               g_modelPath;       // Linux/macOS: ORT uses char*
 #endif
 static QMutex                    g_envMutex;         // serialises one-time env init
+static QMutex                    g_fftwMutex;        // V4: FFTW3 planner is not thread-safe
 
 // Thread-local session state.
 // Raw pointers: safe with MinGW64 thread_local (trivial type).
@@ -338,8 +339,16 @@ void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
 
     fftw_complex *in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * Nt * Ny * Nx);
     fftw_complex *out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * Nt * Ny * Nx);
-    fftw_plan p_fwd = fftw_plan_dft_3d(Nt, Ny, Nx, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
-    fftw_plan p_inv = fftw_plan_dft_3d(Nt, Ny, Nx, out, in, FFTW_BACKWARD, FFTW_ESTIMATE);
+
+    // V4: FFTW3's planner uses global state and is NOT thread-safe.
+    // Only plan creation/destruction needs the lock — plan execution
+    // (fftw_execute) is safe to call concurrently on different plans.
+    fftw_plan p_fwd, p_inv;
+    {
+        QMutexLocker locker(&g_fftwMutex);
+        p_fwd = fftw_plan_dft_3d(Nt, Ny, Nx, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
+        p_inv = fftw_plan_dft_3d(Nt, Ny, Nx, out, in, FFTW_BACKWARD, FFTW_ESTIMATE);
+    }
 
     std::vector<double> winX(Nx), winY(Ny), winT(Nt);
     for(int i=0; i<Nx; ++i) winX[i] = sin(M_PI * (i + 0.5) / Nx);
@@ -613,7 +622,10 @@ void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
             }
         }
     }
-    fftw_destroy_plan(p_fwd); fftw_destroy_plan(p_inv);
+    {
+        QMutexLocker locker(&g_fftwMutex);
+        fftw_destroy_plan(p_fwd); fftw_destroy_plan(p_inv);
+    }
     fftw_free(in); fftw_free(out);
 }
 
