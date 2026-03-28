@@ -390,6 +390,12 @@ void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
     }
 
     if (g_envReady.load(std::memory_order_acquire) && !tl_sessionReady) {
+        // V4: Serialize session creation under g_envMutex.
+        // The first session allocates the CUDA context (~30-60s).
+        // Subsequent sessions reuse it (~1-2s each).  Without this,
+        // 32 threads racing to create CUDA contexts simultaneously
+        // causes minutes of GPU memory allocation contention.
+        QMutexLocker sessionLocker(&g_envMutex);
         try {
             Ort::SessionOptions session_options;
             session_options.SetIntraOpNumThreads(1);  // V3: 1 thread per

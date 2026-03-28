@@ -256,13 +256,67 @@ void DecoderPool::loadFieldsSafe(SourceVideo &sourceVideo, qint32 firstFrame, qi
                                  qint32 lookBehind, qint32 lookAhead,
                                  QVector<SourceField> &fields, qint32 &startIndex, qint32 &endIndex)
 {
-    // Serialize access to ldDecodeMetaData which may not be thread-safe.
-    // In chunk mode, inputMutex is otherwise unused (getInputFrames is not called).
-    // Each thread's own SourceVideo is passed through — only metadata is shared.
-    QMutexLocker locker(&inputMutex);
-    SourceField::loadFields(sourceVideo, ldDecodeMetaData,
-                            firstFrame, numFrames, lookBehind, lookAhead,
-                            fields, startIndex, endIndex);
+    // Two-phase field loading:
+    //   Phase 1 (under mutex): read field numbers + metadata from LdDecodeMetaData
+    //            — fast, just struct copies / integer lookups.
+    //   Phase 2 (no mutex):    read pixel data from the thread's own SourceVideo
+    //            — slow I/O, runs in parallel across all chunk threads.
+
+    startIndex = 2 * lookBehind;
+    endIndex = startIndex + (2 * numFrames);
+    const qint32 totalFields = endIndex + (2 * lookAhead);
+    fields.resize(totalFields);
+    const qint32 numFieldPairs = totalFields / 2;
+
+    // Per-frame metadata gathered under the lock
+    struct FieldMeta {
+        qint32 firstFieldNum;
+        qint32 secondFieldNum;
+        LdDecodeMetaData::Field firstField;
+        LdDecodeMetaData::Field secondField;
+        bool blank;
+    };
+    QVector<FieldMeta> meta(numFieldPairs);
+
+    quint16 black;
+
+    // ---- Phase 1: metadata (serialized, fast) ----
+    {
+        QMutexLocker locker(&inputMutex);
+        const auto &vp = ldDecodeMetaData.getVideoParameters();
+        black = vp.black16bIre;
+        const qint32 numInputFrames = ldDecodeMetaData.getNumberOfFrames();
+        qint32 frameNumber = firstFrame - lookBehind;
+
+        for (qint32 i = 0; i < numFieldPairs; i++) {
+            const bool useBlank = frameNumber < 1 || frameNumber > numInputFrames;
+            const qint32 lookupFrame = useBlank ? 1 : frameNumber;
+
+            meta[i].firstFieldNum  = ldDecodeMetaData.getFirstFieldNumber(lookupFrame);
+            meta[i].secondFieldNum = ldDecodeMetaData.getSecondFieldNumber(lookupFrame);
+            meta[i].firstField     = ldDecodeMetaData.getField(meta[i].firstFieldNum);
+            meta[i].secondField    = ldDecodeMetaData.getField(meta[i].secondFieldNum);
+            meta[i].blank          = useBlank;
+            frameNumber++;
+        }
+    }
+    // ---- Mutex released — Phase 2 runs lock-free ----
+
+    const qint32 fieldLength = sourceVideo.getFieldLength();
+
+    for (qint32 i = 0; i < numFieldPairs; i++) {
+        const qint32 fi = i * 2;
+        fields[fi].field     = meta[i].firstField;
+        fields[fi + 1].field = meta[i].secondField;
+
+        if (meta[i].blank) {
+            fields[fi].data.fill(black, fieldLength);
+            fields[fi + 1].data.fill(black, fieldLength);
+        } else {
+            fields[fi].data     = sourceVideo.getVideoField(meta[i].firstFieldNum);
+            fields[fi + 1].data = sourceVideo.getVideoField(meta[i].secondFieldNum);
+        }
+    }
 }
 
 // Write one output frame. You must hold outputMutex to call this.
