@@ -52,6 +52,23 @@ public:
     // Returns true on success; on failure, prints a message and returns false.
     bool process();
 
+    // V4: Chunk parallelism — each thread processes an independent frame range
+    struct ChunkInfo {
+        qint32 chunkStart;    // first frame to output (global frame number)
+        qint32 chunkEnd;      // one past last frame to output
+        qint32 loadStart;     // first frame to load (including guard frames)
+        qint32 loadEnd;       // one past last frame to load
+        qint32 guardBefore;   // number of guard frames before chunkStart
+        qint32 guardAfter;    // number of guard frames after chunkEnd
+    };
+
+    bool isChunkMode() const { return chunkMode; }
+    bool getChunkAssignment(ChunkInfo &chunk);
+    QString getInputFileName() const { return inputFileName; }
+    LdDecodeMetaData &getMetaData() { return ldDecodeMetaData; }
+    qint32 getDecoderLookBehind() const { return decoderLookBehind; }
+    qint32 getDecoderLookAhead() const { return decoderLookAhead; }
+
     // For worker threads: get the configured OutputWriter
     OutputWriter &getOutputWriter() {
         return outputWriter;
@@ -101,6 +118,11 @@ private:
     // Atomic abort flag shared by worker threads; workers watch this, and shut
     // down as soon as possible if it becomes true
     QAtomicInt abort;
+
+    // V4: Chunk parallelism state
+    bool chunkMode = false;
+    QVector<ChunkInfo> chunks;
+    QAtomicInt nextChunkIndex;
 
     // Input stream information (all guarded by inputMutex while threads are running)
     QMutex inputMutex;

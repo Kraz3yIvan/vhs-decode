@@ -118,6 +118,45 @@ bool DecoderPool::process()
     lastFrameNumber = length + (startFrame - 1);
     totalTimer.start();
 
+    // V4: Compute chunk assignments for parallel 3D processing.
+    // Each thread gets an independent range of frames with guard frames at
+    // boundaries for temporal context.  Guard frames are decoded (providing
+    // the 3D model's temporal depth) but their output is discarded.
+    chunkMode = false;
+    if (maxThreads > 1 && decoderLookAhead > 0) {
+        static constexpr qint32 GUARD_FRAMES = 5;
+        const qint32 numChunks = qMin(maxThreads, length);
+
+        if (numChunks > 1) {
+            chunkMode = true;
+            chunks.resize(numChunks);
+            nextChunkIndex.storeRelaxed(0);
+
+            const qint32 framesPerChunk = length / numChunks;
+            const qint32 remainder = length % numChunks;
+
+            for (qint32 i = 0; i < numChunks; i++) {
+                ChunkInfo &c = chunks[i];
+                // Distribute remainder frames across the first 'remainder' chunks
+                c.chunkStart = startFrame + i * framesPerChunk + qMin(i, remainder);
+                c.chunkEnd = c.chunkStart + framesPerChunk + (i < remainder ? 1 : 0);
+
+                // Guard frames: extend load range, clamped to file bounds
+                c.loadStart = qMax(1, c.chunkStart - GUARD_FRAMES);
+                c.loadEnd = qMin(lastFrameNumber + 1, c.chunkEnd + GUARD_FRAMES);
+                c.guardBefore = c.chunkStart - c.loadStart;
+                c.guardAfter = c.loadEnd - c.chunkEnd;
+            }
+
+            // In chunk mode, threads load their own fields — skip shared input counter
+            inputFrameNumber = lastFrameNumber + 1;
+
+            qInfo() << "V4: Chunk parallelism enabled —" << numChunks
+                    << "chunks," << GUARD_FRAMES << "guard frames,"
+                    << framesPerChunk << "frames/chunk";
+        }
+    }
+
     // Start a vector of filtering threads to process the video
     QVector<QThread *> threads;
     threads.resize(maxThreads);
@@ -140,9 +179,11 @@ bool DecoderPool::process()
     }
 
     // Check we've processed all the frames, now the workers have finished
-    if (inputFrameNumber != (lastFrameNumber + 1) || outputFrameNumber != (lastFrameNumber + 1)
-        || !pendingOutputFrames.empty()) {
-        qCritical() << "Incorrect state at end of processing";
+    if (outputFrameNumber != (lastFrameNumber + 1) || !pendingOutputFrames.empty()) {
+        qCritical() << "Incorrect state at end of processing —"
+                    << "outputFrame:" << outputFrameNumber
+                    << "expected:" << (lastFrameNumber + 1)
+                    << "pending:" << pendingOutputFrames.size();
         sourceVideo.close();
         targetVideo.close();
         return false;
@@ -200,6 +241,14 @@ bool DecoderPool::putOutputFrames(qint32 startFrameNumber, const QVector<OutputF
         }
     }
 
+    return true;
+}
+
+bool DecoderPool::getChunkAssignment(ChunkInfo &chunk)
+{
+    const int idx = nextChunkIndex.fetchAndAddRelaxed(1);
+    if (idx >= chunks.size()) return false;
+    chunk = chunks[idx];
     return true;
 }
 

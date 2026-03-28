@@ -94,6 +94,11 @@ public:
 protected:
     void run() override;
 
+    // V4: Chunk-parallel run path — thread opens its own SourceVideo,
+    // loads its assigned frame range (with guard frames), decodes all,
+    // and outputs only the non-guard frames.
+    void runChunk();
+
     // Decode a sequence of composite fields into a sequence of component frames
     virtual void decodeFrames(const QVector<SourceField> &inputFields, qint32 startIndex, qint32 endIndex,
                               QVector<ComponentFrame> &componentFrames) = 0;
