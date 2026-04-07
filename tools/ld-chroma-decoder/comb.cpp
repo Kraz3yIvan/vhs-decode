@@ -10,7 +10,7 @@
 
     This file is part of ld-decode-tools.
 
-    V3: Thread-local ONNX sessions for parallel GPU inference.
+    V5: Batched FFT + batched ONNX inference for maximum throughput.
 
 ************************************************************************/
 
@@ -328,50 +328,106 @@ void Comb::FrameBuffer::split2D()
 #define IDX3(t, y, x, Nt, Ny, Nx) ((t)*(Ny)*(Nx) + (y)*(Nx) + (x))
 #endif
 
+// =============================================================================
+// V5: Batched FFT + Batched ONNX Inference
+//
+// Three-phase pipeline per frame pair:
+//   Phase 1 — Fill all block data into a contiguous buffer (CPU)
+//   Phase 2 — One batched forward FFT, one batched ONNX Run(), one batched inverse FFT
+//   Phase 3 — Overlap-add accumulation from batched results (CPU)
+//
+// Performance gains over V3/V4:
+//   - fftw_plan_many_dft:  all blocks in one FFTW call (SIMD-optimal)
+//   - Batched ONNX:        one GPU kernel launch instead of ~5000
+//   - FFTW_MEASURE:        optimal algorithm selection (cached across frames)
+//   - Static buffers:      zero per-frame allocation overhead
+//   - Pre-computed windows: avoid redundant trig in inner loops
+// =============================================================================
+
+// --- V5: Thread-local cached state for batched FFT plans and buffers ---
+// Each thread gets its own buffers and plans — safe for concurrent split3D.
+// Re-allocated only if block count changes (which it shouldn't between frames).
+// Raw pointers for thread_local: same MinGW64 rationale as tl_session.
+static thread_local fftw_complex* tl_fftInBatch  = nullptr;
+static thread_local fftw_complex* tl_fftOutBatch = nullptr;
+static thread_local fftw_plan     tl_batchFwd    = nullptr;
+static thread_local fftw_plan     tl_batchInv    = nullptr;
+static thread_local int           tl_cachedBlockCount = 0;
+
+// V5: Pre-computed 3D window product table [Nt][Ny][Nx]
+// Avoids 3 multiplies per voxel in the inner loops.
+static double g_win3D[4][16][16];
+static bool   g_win3DReady = false;
+
+static void ensureWin3D()
+{
+    if (g_win3DReady) return;
+    constexpr int Nt = 4, Ny = 16, Nx = 16;
+    for (int t = 0; t < Nt; ++t) {
+        double wt = sin(M_PI * (t + 0.5) / Nt);
+        for (int y = 0; y < Ny; ++y) {
+            double wy = sin(M_PI * (y + 0.5) / Ny);
+            for (int x = 0; x < Nx; ++x) {
+                double wx = sin(M_PI * (x + 0.5) / Nx);
+                g_win3D[t][y][x] = wt * wy * wx;
+            }
+        }
+    }
+    g_win3DReady = true;
+}
+
+// V5: Pre-computed reflection index LUT for RefMag channel.
+// Maps (t, y, x) -> flat index into the 1024-element block.
+static int g_refIdx[4][16][16];
+static bool g_refIdxReady = false;
+
+static void ensureRefIdx()
+{
+    if (g_refIdxReady) return;
+    constexpr int Nt = 4, Ny = 16, Nx = 16;
+    for (int t = 0; t < Nt; ++t) {
+        int ref_t = ((2 - t) % 4 + 4) % 4;
+        for (int y = 0; y < Ny; ++y) {
+            int ref_y = (16 - y) % 16;
+            for (int x = 0; x < Nx; ++x) {
+                int ref_x = ((8 - x) % 16 + 16) % 16;
+                g_refIdx[t][y][x] = IDX3(ref_t, ref_y, ref_x, Nt, Ny, Nx);
+            }
+        }
+    }
+    g_refIdxReady = true;
+}
+
+struct BlockLedger {
+    int y, x;
+    double blockDC;
+};
+
 void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
 {
-    const int Nx = 16;
-    const int Ny = 16;
-    const int Nt = 4;
-    
-    const int STEP_X = 8;
-    const int STEP_Y = 8;
+    constexpr int Nx = 16, Ny = 16, Nt = 4;
+    constexpr int STEP_X = 8, STEP_Y = 8;
+    constexpr int BLOCK_SIZE = Nt * Ny * Nx; // 1024
 
-    fftw_complex *in = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * Nt * Ny * Nx);
-    fftw_complex *out = (fftw_complex*) fftw_malloc(sizeof(fftw_complex) * Nt * Ny * Nx);
-
-    // V4: FFTW3's planner uses global state and is NOT thread-safe.
-    // Only plan creation/destruction needs the lock — plan execution
-    // (fftw_execute) is safe to call concurrently on different plans.
-    fftw_plan p_fwd, p_inv;
-    {
-        QMutexLocker locker(&g_fftwMutex);
-        p_fwd = fftw_plan_dft_3d(Nt, Ny, Nx, in, out, FFTW_FORWARD, FFTW_ESTIMATE);
-        p_inv = fftw_plan_dft_3d(Nt, Ny, Nx, out, in, FFTW_BACKWARD, FFTW_ESTIMATE);
-    }
-
-    std::vector<double> winX(Nx), winY(Ny), winT(Nt);
-    for(int i=0; i<Nx; ++i) winX[i] = sin(M_PI * (i + 0.5) / Nx);
-    for(int i=0; i<Ny; ++i) winY[i] = sin(M_PI * (i + 0.5) / Ny);
-    for(int i=0; i<Nt; ++i) winT[i] = sin(M_PI * (i + 0.5) / Nt); 
+    ensureWin3D();
+    ensureRefIdx();
 
     FrameBuffer* frames[2] = { this, &nextFrame };
 
-    int startY = videoParameters.firstActiveFrameLine - (Ny / 2); 
-    int endY = videoParameters.lastActiveFrameLine; 
-    
-    int startX = videoParameters.activeVideoStart - (Nx / 2);
-    int endX = videoParameters.activeVideoEnd;
+    const int startY = videoParameters.firstActiveFrameLine - (Ny / 2);
+    const int endY   = videoParameters.lastActiveFrameLine;
+    const int startX = videoParameters.activeVideoStart - (Nx / 2);
+    const int endX   = videoParameters.activeVideoEnd;
 
-    // =================================================================
-    // V3: Ensure this thread has its own ONNX session.
-    //
-    // Step 1 — Global env (once per process, under mutex).
-    // Step 2 — Thread-local session (once per thread, no mutex needed
-    //          because Ort::Session ctor is thread-safe given a valid Env,
-    //          and each thread writes only its own tl_ variables).
-    // =================================================================
+    // ---- Count blocks ----
+    int numBlocks = 0;
+    for (int y = startY; y < endY; y += STEP_Y)
+        for (int x = startX; x < endX; x += STEP_X)
+            numBlocks++;
 
+    if (numBlocks == 0) return;
+
+    // ---- V5: ONNX session init (once per thread) ----
     if (!g_envReady.load(std::memory_order_acquire)) {
         QMutexLocker locker(&g_envMutex);
         if (!g_envReady.load(std::memory_order_relaxed)) {
@@ -379,7 +435,6 @@ void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
                 g_ortEnv = std::make_unique<Ort::Env>(
                     ORT_LOGGING_LEVEL_WARNING, "NTSC_AI");
 
-                // Cache the model path now (main thread has QCoreApplication).
                 QString modelPathQ = QCoreApplication::applicationDirPath()
                                    + "/chroma_net.onnx";
 #ifdef _WIN32
@@ -387,11 +442,8 @@ void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
 #else
                 g_modelPath = modelPathQ.toStdString();
 #endif
-
                 g_envReady.store(true, std::memory_order_release);
-                qDebug() << "AI: Ort::Env created, model path:"
-                         << modelPathQ;
-
+                qDebug() << "AI: Ort::Env created, model path:" << modelPathQ;
             } catch (const std::exception& e) {
                 qCritical() << "AI: Failed to create Ort::Env:" << e.what();
             }
@@ -399,19 +451,13 @@ void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
     }
 
     if (g_envReady.load(std::memory_order_acquire) && !tl_sessionReady) {
-        // V4: Serialize session creation under g_envMutex.
-        // The first session allocates the CUDA context (~30-60s).
-        // Subsequent sessions reuse it (~1-2s each).  Without this,
-        // 32 threads racing to create CUDA contexts simultaneously
-        // causes minutes of GPU memory allocation contention.
         QMutexLocker sessionLocker(&g_envMutex);
         try {
             Ort::SessionOptions session_options;
-            session_options.SetIntraOpNumThreads(1);  // V3: 1 thread per
-                // session — the parallelism comes from having 32 sessions,
-                // not from ORT-internal threading.  This also avoids
-                // over-subscribing CPU cores and reduces per-session
-                // memory overhead.
+            // V5: Allow ORT to use multiple threads internally for the
+            // single large batched inference call (replaces V3's 32
+            // single-threaded sessions).
+            session_options.SetIntraOpNumThreads(0);  // 0 = ORT picks optimal
 
 #ifdef USE_CUDA
             try {
@@ -421,212 +467,235 @@ void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
                     OrtCudnnConvAlgoSearchHeuristic;
                 session_options.AppendExecutionProvider_CUDA(cuda_options);
                 g_using_cuda.store(true, std::memory_order_relaxed);
-                qDebug() << "AI: Thread" << QThread::currentThreadId()
-                         << "— CUDA provider registered";
+                qDebug() << "AI: CUDA provider registered";
             } catch (const std::exception& cuda_err) {
-                qWarning() << "AI: Thread" << QThread::currentThreadId()
-                           << "— CUDA fallback to CPU:" << cuda_err.what();
+                qWarning() << "AI: CUDA fallback to CPU:" << cuda_err.what();
             }
 #endif
 
-            // V3: raw `new` — intentionally no unique_ptr.
-            // MinGW64's __emutls does not reliably call destructors for
-            // thread_local objects with non-trivial dtors.  These sessions
-            // live until thread exit (QThreadPool workers → process exit),
-            // so the "leak" is harmless.
             tl_session = new Ort::Session(
                 *g_ortEnv, g_modelPath.c_str(), session_options);
-
             tl_sessionReady = true;
-            qDebug() << "AI: Thread" << QThread::currentThreadId()
-                     << "— session created"
+            qDebug() << "AI: Session created"
                      << (g_using_cuda.load() ? "[CUDA/GPU]" : "[CPU]");
-
         } catch (const std::exception& e) {
-            qCritical() << "AI: Thread" << QThread::currentThreadId()
-                        << "— failed to create session:" << e.what();
+            qCritical() << "AI: Failed to create session:" << e.what();
         }
     }
 
+    // ---- V5: Ensure batched FFT plans and buffers (cached, FFTW_MEASURE) ----
+    {
+        QMutexLocker locker(&g_fftwMutex);
+        if (tl_cachedBlockCount != numBlocks) {
+            if (tl_batchFwd) fftw_destroy_plan(tl_batchFwd);
+            if (tl_batchInv) fftw_destroy_plan(tl_batchInv);
+            if (tl_fftInBatch)  fftw_free(tl_fftInBatch);
+            if (tl_fftOutBatch) fftw_free(tl_fftOutBatch);
+
+            tl_fftInBatch  = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * numBlocks * BLOCK_SIZE);
+            tl_fftOutBatch = (fftw_complex*)fftw_malloc(sizeof(fftw_complex) * numBlocks * BLOCK_SIZE);
+
+            int n[] = { Nt, Ny, Nx };
+            tl_batchFwd = fftw_plan_many_dft(3, n, numBlocks,
+                tl_fftInBatch,  nullptr, 1, BLOCK_SIZE,
+                tl_fftOutBatch, nullptr, 1, BLOCK_SIZE,
+                FFTW_FORWARD, FFTW_MEASURE);
+            tl_batchInv = fftw_plan_many_dft(3, n, numBlocks,
+                tl_fftOutBatch, nullptr, 1, BLOCK_SIZE,
+                tl_fftInBatch,  nullptr, 1, BLOCK_SIZE,
+                FFTW_BACKWARD, FFTW_MEASURE);
+
+            tl_cachedBlockCount = numBlocks;
+            qDebug() << "AI: V5 batched FFTW plans created for"
+                     << numBlocks << "blocks (FFTW_MEASURE)";
+        }
+    }
+
+    // ================================================================
+    // PHASE 1: Fill all blocks into contiguous FFT buffer
+    // ================================================================
+    std::vector<BlockLedger> ledger;
+    ledger.reserve(numBlocks);
+
+    int b = 0;
     for (int y = startY; y < endY; y += STEP_Y) {
         for (int x = startX; x < endX; x += STEP_X) {
 
-            for(int i=0; i < Nt*Ny*Nx; ++i) { in[i][0] = 0.0; in[i][1] = 0.0; }
-
+            // --- Compute block DC ---
             double blockDC = 0.0;
             int pixelCount = 0;
 
-            for (int f = 0; f < 2; ++f) { 
-                for (int sub_t = 0; sub_t < 2; ++sub_t) { 
+            for (int f = 0; f < 2; ++f) {
+                for (int sub_t = 0; sub_t < 2; ++sub_t) {
                     int t = f * 2 + sub_t;
-                    bool isOddField = (t % 2 != 0); 
-                    
+                    bool isOddField = (t % 2 != 0);
+
                     for (int dy = 0; dy < Ny; ++dy) {
                         int absY = y + dy;
-                        bool isYInside = (absY >= videoParameters.firstActiveFrameLine) && (absY < videoParameters.lastActiveFrameLine);
-                        
-                        bool isOddLine = (absY % 2 != 0);
-                        if (isOddLine != isOddField) continue;
+                        if (absY < videoParameters.firstActiveFrameLine ||
+                            absY >= videoParameters.lastActiveFrameLine) continue;
+                        if ((absY % 2 != 0) != isOddField) continue;
 
-                        if (isYInside) {
-                            const quint16 *lineData = frames[f]->rawbuffer.data() + (absY * videoParameters.fieldWidth);
-                            for (int dx = 0; dx < Nx; ++dx) {
-                                int absX = x + dx;
-                                bool isXInside = (absX >= videoParameters.activeVideoStart) && (absX < videoParameters.activeVideoEnd);
-                                
-                                if (isXInside) {
-                                    double val = (double)lineData[absX];
-                                    int i = IDX3(t, dy, dx, Nt, Ny, Nx);
-                                    in[i][0] = val; 
-                                    blockDC += val;
-                                    pixelCount++;
-                                }
+                        const quint16 *lineData = frames[f]->rawbuffer.data()
+                            + (absY * videoParameters.fieldWidth);
+                        for (int dx = 0; dx < Nx; ++dx) {
+                            int absX = x + dx;
+                            if (absX >= videoParameters.activeVideoStart &&
+                                absX < videoParameters.activeVideoEnd) {
+                                blockDC += lineData[absX];
+                                pixelCount++;
                             }
                         }
                     }
                 }
             }
             if (pixelCount > 0) blockDC /= (double)pixelCount;
+            ledger.push_back({y, x, blockDC});
 
-            for(int t=0; t<Nt; ++t) {
+            // --- Fill FFT input (DC-removed, windowed) ---
+            const int batchOffset = b * BLOCK_SIZE;
+
+            for (int t = 0; t < Nt; ++t) {
+                FrameBuffer* currFrame = frames[t / 2];
                 bool isOddField = (t % 2 != 0);
-                for(int dy=0; dy<Ny; ++dy) {
+
+                for (int dy = 0; dy < Ny; ++dy) {
                     int absY = y + dy;
-                    bool isYInside = (absY >= videoParameters.firstActiveFrameLine) && (absY < videoParameters.lastActiveFrameLine);
+                    bool isYInside = (absY >= videoParameters.firstActiveFrameLine) &&
+                                     (absY < videoParameters.lastActiveFrameLine);
                     bool isOddLine = (absY % 2 != 0);
 
                     for (int dx = 0; dx < Nx; ++dx) {
                         int absX = x + dx;
-                        bool isXInside = (absX >= videoParameters.activeVideoStart) && (absX < videoParameters.activeVideoEnd);
-                        
-                        int idx = IDX3(t, dy, dx, Nt, Ny, Nx);
+                        int idx = batchOffset + IDX3(t, dy, dx, Nt, Ny, Nx);
 
-                        if (isYInside && isXInside && (isOddLine == isOddField)) {
-                            in[idx][0] = (in[idx][0] - blockDC) * winT[t] * winY[dy] * winX[dx];
+                        if (isYInside && (isOddLine == isOddField) &&
+                            absX >= videoParameters.activeVideoStart &&
+                            absX < videoParameters.activeVideoEnd) {
+                            double val = currFrame->rawbuffer[absY * videoParameters.fieldWidth + absX];
+                            tl_fftInBatch[idx][0] = (val - blockDC) * g_win3D[t][dy][dx];
                         } else {
-                            in[idx][0] = 0.0;
+                            tl_fftInBatch[idx][0] = 0.0;
                         }
+                        tl_fftInBatch[idx][1] = 0.0;
                     }
                 }
             }
+            b++;
+        }
+    }
 
-            fftw_execute(p_fwd);
+    // ================================================================
+    // PHASE 2: Batched Forward FFT → Batched ONNX → Batched Inverse FFT
+    // ================================================================
 
-            // =========================================================
-            // V3: Neural Network Chroma Mask — thread-local session
-            // =========================================================
+    // --- One call: all blocks forward-transformed ---
+    fftw_execute(tl_batchFwd);
 
-            if (tl_sessionReady) {
-                std::vector<int64_t> input_shape = {1, 2, 4, 16, 16};
-                constexpr size_t input_element_count = 2048;
-                std::vector<float> input_tensor_values(input_element_count);
+    // --- Batched ONNX inference ---
+    if (tl_sessionReady) {
+        // Build tensor [numBlocks, 2, 4, 16, 16]
+        std::vector<int64_t> input_shape = {
+            static_cast<int64_t>(numBlocks), 2,
+            static_cast<int64_t>(Nt), static_cast<int64_t>(Ny), static_cast<int64_t>(Nx)
+        };
+        const size_t tensorElements = numBlocks * 2 * BLOCK_SIZE;
+        std::vector<float> inputTensor(tensorElements);
 
-                int ptr = 0;
+        int ptr = 0;
+        for (b = 0; b < numBlocks; ++b) {
+            const int batchOffset = b * BLOCK_SIZE;
 
-                for (int t = 0; t < Nt; ++t) {
-                    for (int yy = 0; yy < Ny; ++yy) {
-                        for (int xx = 0; xx < Nx; ++xx) {
-                            int idx = IDX3(t, yy, xx, Nt, Ny, Nx);
-                            double mag = sqrt(out[idx][0]*out[idx][0]
-                                           + out[idx][1]*out[idx][1]);
-                            input_tensor_values[ptr++] = static_cast<float>(mag);
-                        }
-                    }
-                }
-
-                for (int t = 0; t < Nt; ++t) {
-                    int ref_t = (2 - t) % 4;
-                    if (ref_t < 0) ref_t += 4;
-
-                    for (int yy = 0; yy < Ny; ++yy) {
-                        int ref_y = (16 - yy) % 16;
-                        for (int xx = 0; xx < Nx; ++xx) {
-                            int ref_x = (8 - xx) % 16;
-                            if (ref_x < 0) ref_x += 16;
-
-                            int idx_ref = IDX3(ref_t, ref_y, ref_x, Nt, Ny, Nx);
-                            double mag_ref = sqrt(out[idx_ref][0]*out[idx_ref][0]
-                                               + out[idx_ref][1]*out[idx_ref][1]);
-                            input_tensor_values[ptr++] = static_cast<float>(mag_ref);
-                        }
-                    }
-                }
-
-                auto memory_info = Ort::MemoryInfo::CreateCpu(
-                    OrtArenaAllocator, OrtMemTypeDefault);
-
-                Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-                    memory_info,
-                    input_tensor_values.data(),
-                    input_element_count,
-                    input_shape.data(),
-                    input_shape.size()
-                );
-
-                const char* input_names[]  = {"input"};
-                const char* output_names[] = {"output"};
-
-                // V3: No mutex needed — each thread owns its own session.
-                // The CUDA runtime handles GPU-side scheduling internally;
-                // multiple CUDA streams from different ORT sessions can
-                // overlap kernel execution and memory transfers on the GPU.
-                auto output_tensors = tl_session->Run(
-                     Ort::RunOptions{nullptr},
-                     input_names, &input_tensor, 1,
-                     output_names, 1
-                    );
-
-                float* mask_data = output_tensors[0].GetTensorMutableData<float>();
-
-                int mask_idx = 0;
-                for (int t = 0; t < Nt; ++t) {
-                    for (int yy = 0; yy < Ny; ++yy) {
-                        for (int xx = 0; xx < Nx; ++xx) {
-                            int idx = IDX3(t, yy, xx, Nt, Ny, Nx);
-                            float gain = mask_data[mask_idx++];
-                            out[idx][0] *= gain;
-                            out[idx][1] *= gain;
-                        }
-                    }
-                }
-            }
-            // =========================================================
-
-            fftw_execute(p_inv);
-
+            // Channel 0: Magnitude
             for (int t = 0; t < Nt; ++t) {
-                int f_idx = t / 2;
-                bool isOddField = (t % 2 != 0);
-                FrameBuffer* targetFrame = frames[f_idx];
+                for (int yy = 0; yy < Ny; ++yy) {
+                    for (int xx = 0; xx < Nx; ++xx) {
+                        int idx = batchOffset + IDX3(t, yy, xx, Nt, Ny, Nx);
+                        double re = tl_fftOutBatch[idx][0];
+                        double im = tl_fftOutBatch[idx][1];
+                        inputTensor[ptr++] = static_cast<float>(sqrt(re * re + im * im));
+                    }
+                }
+            }
 
-                for (int dy = 0; dy < Ny; ++dy) {
-                    int absY = y + dy;
-                    
-                    if (absY < videoParameters.firstActiveFrameLine || absY >= videoParameters.lastActiveFrameLine) continue;
-                    if ((absY % 2) != isOddField) continue;
-
-                    for (int dx = 0; dx < Nx; ++dx) {
-                        int absX = x + dx;
-                        
-                        if (absX < videoParameters.activeVideoStart || absX >= videoParameters.activeVideoEnd) continue;
-
-                        int idx = IDX3(t, dy, dx, Nt, Ny, Nx);
-                        
-                        double val = in[idx][0] / (double)(Nt * Ny * Nx);
-                        double w = winT[t] * winY[dy] * winX[dx];
-                        
-                        targetFrame->accChroma[absY][absX] += val * w;
-                        targetFrame->weightSum[absY][absX] += w * w;
+            // Channel 1: Reflected Magnitude (pre-computed LUT)
+            for (int t = 0; t < Nt; ++t) {
+                for (int yy = 0; yy < Ny; ++yy) {
+                    for (int xx = 0; xx < Nx; ++xx) {
+                        int idx_ref = batchOffset + g_refIdx[t][yy][xx];
+                        double re = tl_fftOutBatch[idx_ref][0];
+                        double im = tl_fftOutBatch[idx_ref][1];
+                        inputTensor[ptr++] = static_cast<float>(sqrt(re * re + im * im));
                     }
                 }
             }
         }
+
+        // Single inference call for all blocks
+        auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        Ort::Value inTensor = Ort::Value::CreateTensor<float>(
+            memInfo, inputTensor.data(), tensorElements,
+            input_shape.data(), input_shape.size());
+
+        const char* inputNames[]  = {"input"};
+        const char* outputNames[] = {"output"};
+
+        auto outputTensors = tl_session->Run(
+            Ort::RunOptions{nullptr},
+            inputNames, &inTensor, 1,
+            outputNames, 1);
+
+        // Apply mask to all blocks' FFT coefficients
+        float* maskData = outputTensors[0].GetTensorMutableData<float>();
+        int maskIdx = 0;
+        for (b = 0; b < numBlocks; ++b) {
+            const int batchOffset = b * BLOCK_SIZE;
+            for (int i = 0; i < BLOCK_SIZE; ++i) {
+                float gain = maskData[maskIdx++];
+                tl_fftOutBatch[batchOffset + i][0] *= gain;
+                tl_fftOutBatch[batchOffset + i][1] *= gain;
+            }
+        }
     }
-    {
-        QMutexLocker locker(&g_fftwMutex);
-        fftw_destroy_plan(p_fwd); fftw_destroy_plan(p_inv);
+
+    // --- One call: all blocks inverse-transformed ---
+    fftw_execute(tl_batchInv);
+
+    // ================================================================
+    // PHASE 3: Overlap-Add accumulation
+    // ================================================================
+    const double invBlockSize = 1.0 / (double)BLOCK_SIZE;
+
+    for (b = 0; b < numBlocks; ++b) {
+        const int batchOffset = b * BLOCK_SIZE;
+        const int by = ledger[b].y;
+        const int bx = ledger[b].x;
+
+        for (int t = 0; t < Nt; ++t) {
+            FrameBuffer* targetFrame = frames[t / 2];
+            bool isOddField = (t % 2 != 0);
+
+            for (int dy = 0; dy < Ny; ++dy) {
+                int absY = by + dy;
+                if (absY < videoParameters.firstActiveFrameLine ||
+                    absY >= videoParameters.lastActiveFrameLine) continue;
+                if ((absY % 2 != 0) != isOddField) continue;
+
+                for (int dx = 0; dx < Nx; ++dx) {
+                    int absX = bx + dx;
+                    if (absX < videoParameters.activeVideoStart ||
+                        absX >= videoParameters.activeVideoEnd) continue;
+
+                    int idx = batchOffset + IDX3(t, dy, dx, Nt, Ny, Nx);
+                    double val = tl_fftInBatch[idx][0] * invBlockSize;
+                    double w = g_win3D[t][dy][dx];
+
+                    targetFrame->accChroma[absY][absX] += val * w;
+                    targetFrame->weightSum[absY][absX] += w * w;
+                }
+            }
+        }
     }
-    fftw_free(in); fftw_free(out);
 }
 
 void Comb::FrameBuffer::finalizeOLA() {

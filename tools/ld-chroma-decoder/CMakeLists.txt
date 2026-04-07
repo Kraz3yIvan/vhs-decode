@@ -38,7 +38,7 @@ target_link_libraries(lddecode-chroma
 # ============================================================
 # ONNX Runtime
 #
-# Version locked to 1.16.3 for CUDA 11.8 compatibility.
+# Tested with 1.16.3 (CUDA 11.8) and 1.19.2 (CUDA 12.2).
 #
 # Override at configure time with -DORT_ROOT=<path>, e.g.:
 #   Linux:   -DORT_ROOT=/opt/onnxruntime-linux-x64-gpu-1.16.3
