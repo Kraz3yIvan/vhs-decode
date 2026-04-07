@@ -69,26 +69,21 @@ constexpr double cos4fsc(const qint32 i) {
 }
 
 // =============================================================================
-// V3: Global ONNX Runtime state
+// V5: Global ONNX Runtime state
 //
 // Design rationale:
-//   - ONE Ort::Env per process (ORT requirement). Created once under mutex.
-//   - Each worker thread gets its OWN Ort::Session via thread_local.
-//     This eliminates all inference serialization — 32 threads can run
-//     session->Run() truly in parallel on the GPU.
-//   - Raw pointers for thread_local (not unique_ptr) because MinGW64's
-//     __emutls breaks non-trivial destructors on thread exit. The "leak"
-//     is harmless: QThreadPool threads live until process exit, at which
-//     point the OS reclaims everything.
-//   - using_cuda is std::atomic<bool> for formal correctness (written once
-//     under mutex, then read from many threads).
-//   - modelPath is cached as a platform-appropriate string (wstring on
-//     Windows, string elsewhere) so thread_local session creation doesn't
-//     need QCoreApplication (which is main-thread-only on some Qt builds).
+//   - ONE Ort::Env and ONE Ort::Session per process (created once under mutex).
+//     With batched + sub-batched inference, a single session saturates the GPU.
+//     Multiple sessions just waste VRAM on duplicate CUDA contexts.
+//   - Inference calls are serialised via g_inferenceMutex.  With sub-batches
+//     of 512 blocks (~11 calls per frame), the mutex overhead is negligible.
+//   - Raw pointer for g_session (not unique_ptr) because MinGW64's __emutls
+//     breaks non-trivial destructors.  The session lives until process exit.
+//   - FFTW plans and buffers are thread_local so multiple threads can do
+//     CPU-side FFT work concurrently (useful for CPU-only mode).
 // =============================================================================
 
 static std::unique_ptr<Ort::Env> g_ortEnv;
-static std::atomic<bool>         g_envReady{false};
 static std::atomic<bool>         g_using_cuda{false};
 #ifdef _WIN32
 static std::wstring              g_modelPath;       // Windows: ORT requires wchar_t*
@@ -98,11 +93,13 @@ static std::string               g_modelPath;       // Linux/macOS: ORT uses cha
 static QMutex                    g_envMutex;         // serialises one-time env init
 static QMutex                    g_fftwMutex;        // V4: FFTW3 planner is not thread-safe
 
-// Thread-local session state.
-// Raw pointers: safe with MinGW64 thread_local (trivial type).
-// Sessions are intentionally never deleted — see rationale above.
-static thread_local Ort::Session* tl_session      = nullptr;
-static thread_local bool          tl_sessionReady  = false;
+// V5: Single shared ONNX session for GPU.
+// With batched inference, one session is sufficient — multiple sessions just
+// waste VRAM on duplicate CUDA contexts.  Inference is mutex-protected but
+// that's fine: one large batched call is faster than many small ones anyway.
+static Ort::Session*              g_session        = nullptr;
+static std::atomic<bool>          g_sessionReady{false};
+static QMutex                     g_inferenceMutex; // serialises session->Run()
 
 
 // Public methods -----------------------------------------------------------------------------------------------------
@@ -347,7 +344,7 @@ void Comb::FrameBuffer::split2D()
 // --- V5: Thread-local cached state for batched FFT plans and buffers ---
 // Each thread gets its own buffers and plans — safe for concurrent split3D.
 // Re-allocated only if block count changes (which it shouldn't between frames).
-// Raw pointers for thread_local: same MinGW64 rationale as tl_session.
+// Raw pointers for thread_local: MinGW64 __emutls breaks non-trivial destructors.
 static thread_local fftw_complex* tl_fftInBatch  = nullptr;
 static thread_local fftw_complex* tl_fftOutBatch = nullptr;
 static thread_local fftw_plan     tl_batchFwd    = nullptr;
@@ -427,10 +424,10 @@ void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
 
     if (numBlocks == 0) return;
 
-    // ---- V5: ONNX session init (once per thread) ----
-    if (!g_envReady.load(std::memory_order_acquire)) {
+    // ---- V5: Shared ONNX session init (once per process) ----
+    if (!g_sessionReady.load(std::memory_order_acquire)) {
         QMutexLocker locker(&g_envMutex);
-        if (!g_envReady.load(std::memory_order_relaxed)) {
+        if (!g_sessionReady.load(std::memory_order_relaxed)) {
             try {
                 g_ortEnv = std::make_unique<Ort::Env>(
                     ORT_LOGGING_LEVEL_WARNING, "NTSC_AI");
@@ -442,44 +439,37 @@ void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
 #else
                 g_modelPath = modelPathQ.toStdString();
 #endif
-                g_envReady.store(true, std::memory_order_release);
                 qDebug() << "AI: Ort::Env created, model path:" << modelPathQ;
-            } catch (const std::exception& e) {
-                qCritical() << "AI: Failed to create Ort::Env:" << e.what();
-            }
-        }
-    }
 
-    if (g_envReady.load(std::memory_order_acquire) && !tl_sessionReady) {
-        QMutexLocker sessionLocker(&g_envMutex);
-        try {
-            Ort::SessionOptions session_options;
-            // V5: Allow ORT to use multiple threads internally for the
-            // single large batched inference call (replaces V3's 32
-            // single-threaded sessions).
-            session_options.SetIntraOpNumThreads(0);  // 0 = ORT picks optimal
+                Ort::SessionOptions session_options;
+                // V5: single session, let ORT use multiple threads internally
+                session_options.SetIntraOpNumThreads(0);  // 0 = ORT picks optimal
 
 #ifdef USE_CUDA
-            try {
-                OrtCUDAProviderOptions cuda_options{};
-                cuda_options.device_id = 0;
-                cuda_options.cudnn_conv_algo_search =
-                    OrtCudnnConvAlgoSearchHeuristic;
-                session_options.AppendExecutionProvider_CUDA(cuda_options);
-                g_using_cuda.store(true, std::memory_order_relaxed);
-                qDebug() << "AI: CUDA provider registered";
-            } catch (const std::exception& cuda_err) {
-                qWarning() << "AI: CUDA fallback to CPU:" << cuda_err.what();
-            }
+                try {
+                    OrtCUDAProviderOptions cuda_options{};
+                    cuda_options.device_id = 0;
+                    cuda_options.cudnn_conv_algo_search =
+                        OrtCudnnConvAlgoSearchHeuristic;
+                    // Limit GPU memory to avoid OOM with large batches
+                    cuda_options.gpu_mem_limit = SIZE_MAX;  // ORT default
+                    cuda_options.arena_extend_strategy = 1;  // kSameAsRequested — no over-alloc
+                    session_options.AppendExecutionProvider_CUDA(cuda_options);
+                    g_using_cuda.store(true, std::memory_order_relaxed);
+                    qDebug() << "AI: CUDA provider registered";
+                } catch (const std::exception& cuda_err) {
+                    qWarning() << "AI: CUDA fallback to CPU:" << cuda_err.what();
+                }
 #endif
 
-            tl_session = new Ort::Session(
-                *g_ortEnv, g_modelPath.c_str(), session_options);
-            tl_sessionReady = true;
-            qDebug() << "AI: Session created"
-                     << (g_using_cuda.load() ? "[CUDA/GPU]" : "[CPU]");
-        } catch (const std::exception& e) {
-            qCritical() << "AI: Failed to create session:" << e.what();
+                g_session = new Ort::Session(
+                    *g_ortEnv, g_modelPath.c_str(), session_options);
+                g_sessionReady.store(true, std::memory_order_release);
+                qDebug() << "AI: Session created"
+                         << (g_using_cuda.load() ? "[CUDA/GPU]" : "[CPU]");
+            } catch (const std::exception& e) {
+                qCritical() << "AI: Failed to create session:" << e.what();
+            }
         }
     }
 
@@ -592,68 +582,85 @@ void Comb::FrameBuffer::split3D(FrameBuffer &nextFrame, int frameIdx)
     // --- One call: all blocks forward-transformed ---
     fftw_execute(tl_batchFwd);
 
-    // --- Batched ONNX inference ---
-    if (tl_sessionReady) {
-        // Build tensor [numBlocks, 2, 4, 16, 16]
-        std::vector<int64_t> input_shape = {
-            static_cast<int64_t>(numBlocks), 2,
-            static_cast<int64_t>(Nt), static_cast<int64_t>(Ny), static_cast<int64_t>(Nx)
-        };
-        const size_t tensorElements = numBlocks * 2 * BLOCK_SIZE;
-        std::vector<float> inputTensor(tensorElements);
-
-        int ptr = 0;
-        for (b = 0; b < numBlocks; ++b) {
-            const int batchOffset = b * BLOCK_SIZE;
-
-            // Channel 0: Magnitude
-            for (int t = 0; t < Nt; ++t) {
-                for (int yy = 0; yy < Ny; ++yy) {
-                    for (int xx = 0; xx < Nx; ++xx) {
-                        int idx = batchOffset + IDX3(t, yy, xx, Nt, Ny, Nx);
-                        double re = tl_fftOutBatch[idx][0];
-                        double im = tl_fftOutBatch[idx][1];
-                        inputTensor[ptr++] = static_cast<float>(sqrt(re * re + im * im));
-                    }
-                }
-            }
-
-            // Channel 1: Reflected Magnitude (pre-computed LUT)
-            for (int t = 0; t < Nt; ++t) {
-                for (int yy = 0; yy < Ny; ++yy) {
-                    for (int xx = 0; xx < Nx; ++xx) {
-                        int idx_ref = batchOffset + g_refIdx[t][yy][xx];
-                        double re = tl_fftOutBatch[idx_ref][0];
-                        double im = tl_fftOutBatch[idx_ref][1];
-                        inputTensor[ptr++] = static_cast<float>(sqrt(re * re + im * im));
-                    }
-                }
-            }
-        }
-
-        // Single inference call for all blocks
-        auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
-        Ort::Value inTensor = Ort::Value::CreateTensor<float>(
-            memInfo, inputTensor.data(), tensorElements,
-            input_shape.data(), input_shape.size());
+    // --- V5: Sub-batched ONNX inference ---
+    // Process blocks in chunks of MAX_ONNX_BATCH to keep GPU memory bounded.
+    // Each sub-batch is one session->Run() call.  For a typical NTSC frame
+    // (~5600 blocks), this is ~11 calls at 512 blocks each — still far fewer
+    // than the ~5600 per-block calls in V3.
+    if (g_sessionReady.load(std::memory_order_acquire)) {
+        constexpr int MAX_ONNX_BATCH = 512;
 
         const char* inputNames[]  = {"input"};
         const char* outputNames[] = {"output"};
+        auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
-        auto outputTensors = tl_session->Run(
-            Ort::RunOptions{nullptr},
-            inputNames, &inTensor, 1,
-            outputNames, 1);
+        for (int bStart = 0; bStart < numBlocks; bStart += MAX_ONNX_BATCH) {
+            const int bEnd = std::min(bStart + MAX_ONNX_BATCH, numBlocks);
+            const int subBatchSize = bEnd - bStart;
 
-        // Apply mask to all blocks' FFT coefficients
-        float* maskData = outputTensors[0].GetTensorMutableData<float>();
-        int maskIdx = 0;
-        for (b = 0; b < numBlocks; ++b) {
-            const int batchOffset = b * BLOCK_SIZE;
-            for (int i = 0; i < BLOCK_SIZE; ++i) {
-                float gain = maskData[maskIdx++];
-                tl_fftOutBatch[batchOffset + i][0] *= gain;
-                tl_fftOutBatch[batchOffset + i][1] *= gain;
+            // Build tensor [subBatchSize, 2, 4, 16, 16]
+            std::vector<int64_t> input_shape = {
+                static_cast<int64_t>(subBatchSize), 2,
+                static_cast<int64_t>(Nt), static_cast<int64_t>(Ny), static_cast<int64_t>(Nx)
+            };
+            const size_t tensorElements = subBatchSize * 2 * BLOCK_SIZE;
+            std::vector<float> inputTensor(tensorElements);
+
+            int ptr = 0;
+            for (b = bStart; b < bEnd; ++b) {
+                const int batchOffset = b * BLOCK_SIZE;
+
+                // Channel 0: Magnitude
+                for (int t = 0; t < Nt; ++t) {
+                    for (int yy = 0; yy < Ny; ++yy) {
+                        for (int xx = 0; xx < Nx; ++xx) {
+                            int idx = batchOffset + IDX3(t, yy, xx, Nt, Ny, Nx);
+                            double re = tl_fftOutBatch[idx][0];
+                            double im = tl_fftOutBatch[idx][1];
+                            inputTensor[ptr++] = static_cast<float>(sqrt(re * re + im * im));
+                        }
+                    }
+                }
+
+                // Channel 1: Reflected Magnitude (pre-computed LUT)
+                for (int t = 0; t < Nt; ++t) {
+                    for (int yy = 0; yy < Ny; ++yy) {
+                        for (int xx = 0; xx < Nx; ++xx) {
+                            int idx_ref = batchOffset + g_refIdx[t][yy][xx];
+                            double re = tl_fftOutBatch[idx_ref][0];
+                            double im = tl_fftOutBatch[idx_ref][1];
+                            inputTensor[ptr++] = static_cast<float>(sqrt(re * re + im * im));
+                        }
+                    }
+                }
+            }
+
+            Ort::Value inTensor = Ort::Value::CreateTensor<float>(
+                memInfo, inputTensor.data(), tensorElements,
+                input_shape.data(), input_shape.size());
+
+            // Mutex protects the shared session — one inference at a time.
+            // With sub-batching this is ~11 calls per frame, each saturating
+            // the GPU, so the mutex overhead is negligible.
+            std::vector<Ort::Value> outputTensors;
+            {
+                QMutexLocker inferLock(&g_inferenceMutex);
+                outputTensors = g_session->Run(
+                    Ort::RunOptions{nullptr},
+                    inputNames, &inTensor, 1,
+                    outputNames, 1);
+            }
+
+            // Apply mask to this sub-batch's FFT coefficients
+            float* maskData = outputTensors[0].GetTensorMutableData<float>();
+            int maskIdx = 0;
+            for (b = bStart; b < bEnd; ++b) {
+                const int batchOffset = b * BLOCK_SIZE;
+                for (int i = 0; i < BLOCK_SIZE; ++i) {
+                    float gain = maskData[maskIdx++];
+                    tl_fftOutBatch[batchOffset + i][0] *= gain;
+                    tl_fftOutBatch[batchOffset + i][1] *= gain;
+                }
             }
         }
     }
